@@ -118,7 +118,7 @@
 
 ## 阶段 12：LangGraph 持久化线程状态
 
-状态：待验收
+状态：已完成
 
 - 已使用异步 SQLite Checkpointer 替换自定义 InMemorySessionStore，实现线程级短期记忆与服务重启后的 State 恢复，并由应用 lifespan 管理连接资源。
 - 普通聊天与 SSE 流式聊天共用由用户和会话生成的稳定 thread_id，只提交本轮消息且重置 Tool 轮次，由 Checkpointer 作为唯一线程级状态来源。
