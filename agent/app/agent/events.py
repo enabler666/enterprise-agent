@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, TypeAlias
+from typing import Literal, TypeAlias, TypedDict
+
 
 @dataclass(frozen=True)
 class StatusEvent:
@@ -38,4 +39,24 @@ class DoneEvent:
     type: Literal["done"] = "done"
 
 
-AgentStreamEvent: TypeAlias = StatusEvent | ToolEvent | MessageEvent | ErrorEvent | DoneEvent
+class HumanActionPayload(TypedDict):
+    document_id: str
+    description: str
+
+
+@dataclass(frozen=True)
+class HumanActionRequiredEvent:
+    thread_id: str
+    action_type: Literal["CONFIRM_DELETE"]
+    payload: HumanActionPayload
+    type: Literal["HUMAN_ACTION_REQUIRED"] = "HUMAN_ACTION_REQUIRED"
+
+
+AgentStreamEvent: TypeAlias = (
+    StatusEvent
+    | ToolEvent
+    | MessageEvent
+    | ErrorEvent
+    | DoneEvent
+    | HumanActionRequiredEvent
+)

@@ -125,3 +125,13 @@
 - 业务数据库保存需求、工单等业务事实；Checkpointer 保存 thread 范围内的 Graph State 和执行快照；模型上下文由 Graph 节点从 State 中选择并组装，本阶段暂不裁剪。
 - 已补充线程上下文、用户与会话隔离、消息去重、Tool 配对与轮次重置、SQLite 资源重建恢复、普通与 SSE 共用线程以及异常和中断状态测试，等待维护者执行 Python 依赖锁定与验证。
 - 本阶段不实现 Human-in-the-loop、长期记忆、消息摘要或裁剪等后续能力。
+
+## 阶段 13：高风险删除人工确认 Demo
+
+状态：待验收
+
+- 已扩展 LangGraph State，由聊天入口注入模拟用户身份，并持久化待确认删除动作。
+- 已增加结构化删除预检查与执行 Tool，以内存单据和执行阶段重复权限校验模拟生产边界。
+- 已使用 LangGraph interrupt、现有 Checkpointer 和相同 thread_id 实现暂停、确认或拒绝后的恢复。
+- 已增加 `HUMAN_ACTION_REQUIRED` SSE 事件与聊天恢复接口，并保留原流式路径兼容别名。
+- 已补充删除权限、参数、执行、checkpoint、恢复和 SSE 接口测试，等待维护者执行 Python 验证。

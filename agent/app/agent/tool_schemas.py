@@ -79,4 +79,22 @@ def requirement_tool_schemas() -> list[dict[str, Any]]:
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "delete_prepare",
+                "description": "删除单据前检查单据是否存在、当前用户是否有权限以及风险级别",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "document_id": {
+                            "type": "string",
+                            "description": "明确的单据编号，例如 DOC001",
+                        }
+                    },
+                    "required": ["document_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
     ]

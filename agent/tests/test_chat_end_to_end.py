@@ -87,7 +87,7 @@ def test_chat_calls_agent_tool_and_mocked_java_backend() -> None:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as api_client:
             return await api_client.post(
-                "/chat",
+                "/chat/sync",
                 json={
                     "userId": "user-001",
                     "sessionId": "session-001",

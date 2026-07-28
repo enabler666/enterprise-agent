@@ -1,44 +1,51 @@
 # 当前 Java 后端、Python Agent 与 RAG 调用链
 
-本文记录当前已经实现的只读需求查询与知识问答链路，不描述后续计划中的能力。
+本文记录当前已经实现的只读需求查询、知识问答与高风险删除确认 Demo，不描述后续计划中的能力。
 
 ## 模块职责
 
 | 模块 | 职责 | 边界 |
 | --- | --- | --- |
-| `agent/` | 提供 `/chat` 与 `/chat/stream`，以 SQLite Checkpointer 持久化线程 State，编排 LangGraph，调用 DeepSeek、Java API 和知识索引 | 不直连业务数据库；不执行写操作 |
+| `agent/` | 提供 `/chat` 与 `/chat/resume` SSE，以 SQLite Checkpointer 持久化线程 State，编排 LangGraph，调用 DeepSeek、Java API 和知识索引 | 不直连业务数据库；仅用内存 Map 演示删除 |
 | `backend/` | 提供需求详情、组合检索和进度查询 API，按 Controller → Service → Repository 分层 | 只读；通过 Profile 切换内存与 MySQL Repository |
 | `knowledge/` | 保存用于构建索引的 UTF-8 Markdown 业务说明 | 运行时不会自动重建索引 |
 | `docs/` | 保存接口契约、当前调用链和开发阶段记录 | 不承载运行时代码 |
 
 ## 统一入口与会话
 
-1. 客户端向 `POST /chat` 或 `POST /chat/stream` 提交 `userId`、`sessionId` 和 `message`。
-2. `agent/app/api/chat.py` 将校验后的 `ChatRequest` 交给 `ChatService`。普通接口返回 `ChatResponse`；流式接口只负责把业务事件编码为 SSE。
-3. `ChatService` 通过集中函数将 `(user_id, session_id)` 哈希为固定长度、稳定的 `thread_id`；不同用户即使使用相同 `sessionId` 也不会共享线程。
-4. 普通与流式调用都只提交本轮 `HumanMessage`、重置为 `0` 的 `tool_rounds` 以及包含 `thread_id` 的 config。Graph 从 Checkpointer 自动恢复原有 `messages`，调用方不再读取、拼接或保存完整历史。
+1. 客户端向 `POST /chat` 提交模拟 `user`、可选 `threadId` 和 `message`，接口返回 SSE；`POST /chat/stream` 是兼容别名。
+2. `ChatService` 将 user id、username 和 roles 初始化进 Graph State。生产环境同一位置应改为读取经过验证的 SSO/JWT claims。
+3. 新协议直接使用或生成 `thread_id`；兼容输入 `(userId, sessionId)` 仍会哈希为稳定线程标识。
+4. 新聊天提交本轮 `HumanMessage`、`user_context` 并重置 Tool 轮次；Graph 从 Checkpointer 自动恢复既有 State。`POST /chat/resume` 使用相同 `thread_id` 和 `Command(resume=approval)` 恢复。
 5. FastAPI lifespan 创建并初始化同一个 `AsyncSqliteSaver`，Agent 用它编译 Graph，关闭服务时释放 SQLite 连接。默认数据库为 `agent/data/checkpoints.sqlite`，可通过 `CHECKPOINT_DB_PATH` 配置；相对路径按 `agent/` 目录解析。
 
 ## LangGraph 执行流程
 
-`RequirementAgentState` 包含共享的 `messages` 和 `tool_rounds`：
+`RequirementAgentState` 包含 `messages`、`tool_rounds`、`user_context`、`pending_action` 和 `action_approved`：
 
 - `messages` 使用 `add_messages` reducer 追加 Human、AI 和 Tool 消息。
 - `tool_rounds` 每执行一次工具节点加一，将工具调用循环限制为最多三轮；每次新用户输入都重置为 `0`，不会跨用户轮次累计。
+- `user_context` 让中断恢复后仍能找到发起用户；它保存的是身份上下文，不是可信的授权结论。
+- `pending_action` 保存动作类型、目标和描述，供 checkpoint、SSE 以及恢复节点共享。
 
 ```mermaid
 flowchart LR
     S([START]) --> M[model: _call_model]
     M -->|AIMessage 含 tool_calls 且 tool_rounds < 3| T[tools: _execute_tools]
-    T -->|ToolMessage 回注| M
+    T -->|普通 ToolMessage| M
+    T -->|允许删除且高风险| H[confirm_delete: interrupt]
+    H -->|approval=true| D[execute_delete: 再次鉴权]
+    H -->|approval=false| R[reject_delete]
+    D --> M
+    R --> M
     M -->|无工具调用或达到上限| E([END])
 ```
 
-模型节点在上下文前加入系统提示词，再调用已绑定四个 JSON Schema 的 DeepSeek 模型。模型通过 Tool 选择完成意图路由；当前没有独立 Router 节点、异常解释分支、人工确认节点或多 Agent 子图。
+模型节点在上下文前加入系统提示词，再调用已绑定 Tool Schema 的 DeepSeek 模型。模型可以选择 `delete_prepare`，但不能直接调用 `delete_execute`；执行 Tool 只允许由确认分支触发。
 
-工具节点按名称分派调用，将 `ToolExecutionResult.model_dump_json()` 与原始 tool call id 封装为 `ToolMessage`，使下一次模型调用能够关联工具请求与结果。普通 `/chat` 与流式 `/chat/stream` 共用相同的图、Tool 和提示词。
+工具节点按名称分派调用，将结构化结果与原始 tool call id 封装为 `ToolMessage`。删除预检查允许后，Graph 进入真实 `interrupt`，而不是等待一条普通聊天消息。
 
-## 当前四个 Tool
+## 当前 Tool
 
 | Tool | 实现 | 用途 | 数据来源 |
 | --- | --- | --- | --- |
@@ -46,8 +53,18 @@ flowchart LR
 | `search_requirements` | `RequirementTools.search_requirements` | 组合条件分页查询 | Java API |
 | `get_requirement_progress` | `RequirementTools.get_requirement_progress` | 查询需求进度 | Java API |
 | `search_knowledge` | `KnowledgeTools.search_knowledge` | 查询需求规则和操作说明，固定 TopK 3 | Chroma 知识索引 |
+| `delete_prepare` | `DeleteTools.delete_prepare` | 删除前检查单据、归属和风险 | 内存 Map |
+| `delete_execute` | `DeleteTools.delete_execute` | 人工确认后删除，并再次鉴权 | 内存 Map |
 
 三个 Requirement Tool 先使用 Pydantic 校验参数，再通过异步 `RequirementClient` 请求 Java。`search_knowledge` 只接收完整问题文本，不允许模型控制 TopK。模型不能直接访问 MySQL。
+
+## 高风险删除 HITL 调用链
+
+1. 模型识别“删除单据 DOC001”，只调用 `delete_prepare(document_id)`；Graph 从 State 注入 `user_context`。
+2. Tool 读取内存 `documents` 并校验 owner 或 `admin` 角色。无权时返回结构化 `NO_PERMISSION`；允许时返回 `risk=HIGH` 和 `need_confirmation=true`。
+3. 工具节点写入 `pending_action`，确认节点调用 `interrupt`。Checkpointer 保存同一 `thread_id` 的消息、身份和待处理动作。
+4. SSE 返回 `HUMAN_ACTION_REQUIRED`，只表达 `CONFIRM_DELETE` 业务动作，不包含 `show_dialog` 等 UI 指令。
+5. 客户端调用 `/chat/resume`。同意后 Graph 调用 `delete_execute`；Tool 重新读取单据并重新鉴权，不信任 prepare 的权限结论。拒绝时不调用执行 Tool。
 
 ## 结构化需求查询调用链
 
@@ -160,6 +177,7 @@ sequenceDiagram
 | `message` | 模型最终回答的文本增量，不含 reasoning 或 tool-call chunk |
 | `error` | SSE 已开始后发生的安全、结构化错误 |
 | `done` | Graph 原生流正常结束 |
+| `HUMAN_ACTION_REQUIRED` | interrupt 已持久化，等待客户端以同一 thread_id 恢复 |
 
 Checkpointer 在每个完成的 Graph super-step 后保存 State；模型节点完成后会保存 AI tool call，工具节点以带相同 call id 的 `ToolMessage` 完成配对。意外 Tool 异常会转为明确的失败 ToolMessage，避免留下无法配对的消息。模型异常或客户端取消不会破坏之前已完成的 checkpoint；最多保留本轮已经完成节点的状态，不会把 SSE 裸 token chunk 写入 `messages`。SSE 响应开始后无法修改 HTTP 状态码，异常统一转为 `error` 事件。
 
@@ -168,12 +186,13 @@ Checkpointer 在每个完成的 Graph super-step 后保存 State；模型节点�
 | 位置 | 类 / 方法 | 作用 |
 | --- | --- | --- |
 | `agent/app/main.py` | `create_app` | 创建 FastAPI，在 lifespan 启停 ChatService 及 Checkpointer |
-| `agent/app/api/chat.py` | `chat` / `stream_chat` | 普通响应与业务 SSE 编码 |
-| `agent/app/agent/service.py` | `ChatService.chat` / `stream_chat` / `_get_agent` | 连接会话、Agent、Java Client 和 RAG 组件 |
+| `agent/app/api/chat.py` | `stream_chat` / `resume_chat` | 发起、恢复与业务 SSE 编码 |
+| `agent/app/agent/service.py` | `stream_chat` / `resume_chat` / `_get_agent` | 注入用户上下文并连接 Agent、Java Client 和 RAG |
 | `agent/app/agent/thread_id.py` | `build_thread_id` | 集中生成稳定、固定长度的线程标识 |
-| `agent/app/agent/state.py` | `RequirementAgentState` | 定义 `add_messages` 共享状态与工具轮次 |
-| `agent/app/agent/graph.py` | `ask` / `stream` / `_call_model` / `_route_after_model` / `_execute_tools` | LangGraph 普通与流式入口、模型节点、条件边和工具节点 |
-| `agent/app/agent/tool_schemas.py` | `requirement_tool_schemas` | 定义四个只读 Tool 的 JSON Schema |
+| `agent/app/agent/state.py` | `RequirementAgentState` | 定义消息、用户上下文和待确认动作 |
+| `agent/app/agent/graph.py` | `stream` / `resume` / `_confirm_delete` / `_execute_delete` | LangGraph 发起、interrupt、恢复与执行分支 |
+| `agent/app/agent/tool_schemas.py` | `requirement_tool_schemas` | 定义模型可选择的查询与删除预检查 Schema |
+| `agent/app/tools/delete_tools.py` | `DeleteTools` | 结构化预检查、执行阶段重复鉴权和内存删除 |
 | `agent/app/tools/requirement_tools.py` | `RequirementTools` | 校验需求 Tool 参数并安全映射 Java Client 结果 |
 | `agent/app/clients/requirement_client.py` | `RequirementClient._get` | 异步调用 Java 并校验统一响应 |
 | `agent/app/tools/knowledge_tools.py` | `KnowledgeTools.search_knowledge` | 固定 TopK 3，映射知识检索结果与错误 |
@@ -191,7 +210,7 @@ Checkpointer 在每个完成的 Graph super-step 后保存 State；模型节点�
 
 | 位置 | 情况 | 当前处理 |
 | --- | --- | --- |
-| FastAPI / 模型 | 未设置 `DEEPSEEK_API_KEY` | `/chat` 返回 503；SSE 返回 `AGENT_UNAVAILABLE` error；`/health` 不受影响 |
+| FastAPI / 模型 | 未设置 `DEEPSEEK_API_KEY` | SSE 返回 `AGENT_UNAVAILABLE` error；`/health` 不受影响 |
 | Knowledge Tool | 未设置 `SILICONFLOW_API_KEY` | 返回 `EMBEDDING_NOT_CONFIGURED`，需求 Tool 不受影响 |
 | Knowledge Tool | 索引不存在或为空 | 返回 `KNOWLEDGE_INDEX_NOT_READY` |
 | Knowledge Tool | 索引与查询模型不一致 | 返回 `EMBEDDING_MODEL_MISMATCH`，提示重新构建索引 |
@@ -204,9 +223,9 @@ Checkpointer 在每个完成的 Graph super-step 后保存 State；模型节点�
 
 ## 当前限制
 
-- 仅支持需求只读查询和需求管理知识问答，不支持业务写操作、合同或订单查询。
+- 除内存 Map 的单据删除 HITL Demo 外，不支持真实业务写操作、合同或订单查询。
 - SQLite Checkpointer 支持单实例服务重启恢复；SQLite 不用于多实例共享或生产级高并发。
-- 当前没有认证与数据权限控制。
+- 当前没有真实认证；请求中的 user 只模拟 SSO/JWT。删除 Tool 只实现 owner/admin 的演示权限。
 - RAG 仅做 TopK 向量召回，不包含 Rerank、相似度阈值或 Hybrid Search。
 - 系统提示词暂不支持同一轮组合结构化业务数据 Tool 与知识库 Tool。
 - FastAPI 请求 traceId 尚未完整透传至 Java；Java 会自行读取或生成 traceId。
